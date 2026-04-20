@@ -46,33 +46,29 @@ parser.add_argument('--batch_size', type=int, default=500, help='Batch size')
 parser.add_argument('--dropout', type=float, default=0.0, help='Dropout k')
 parser.add_argument('--k', default=1, help='Folder k')
 parser.add_argument('--agg', default='attention', choices=['mean', 'attantion'], help='Aggregator choose')
+parser.add_argument('--proj_dim', type=int, default=20,
+                    help='Output dimension of OrthogonalProjectionLayer (used in sign loss only). '
+                         'Must be <= --dim. Default 20 = no dimensionality reduction.')
+parser.add_argument('--ortho_weight', type=float, default=5.0,
+                    help='Weight λ for orthogonality regularization penalty Lo = λ||WW^T - I||_F^2. '
+                         'Scale relative to task loss magnitude (task loss ~500 → λ≈5–15).')
 
-args = parser.parse_args()
-
-OUTPUT_DIR = f'./embeddings/sdgnn-{args.agg}'
-if not os.path.exists('embeddings'):
-    os.mkdir('embeddings')
-
-if not os.path.exists(OUTPUT_DIR):
-        os.mkdir(OUTPUT_DIR)
-        
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-
+# ── Module-level defaults (safe to import; overridden by main() at runtime) ──
 NEG_LOSS_RATIO = 1
 INTERVAL_PRINT = 2
-
-NUM_NODE = DATASET_NUM_DIC[args.dataset]
-WEIGHT_DECAY = args.weight_decay
-NODE_FEAT_SIZE = args.fea_dim
-EMBEDDING_SIZE1 = args.dim
-DEVICES = torch.device(args.devices)
-LEARNING_RATE = args.lr
-BATCH_SIZE = args.batch_size
-EPOCHS = args.epochs
-DROUPOUT = args.dropout
-K = args.k
+NUM_NODE       = 3783          # bitcoin_alpha default
+WEIGHT_DECAY   = 0.001
+NODE_FEAT_SIZE = 20
+EMBEDDING_SIZE1= 20
+DEVICES        = torch.device('cpu')
+LEARNING_RATE  = 0.001
+BATCH_SIZE     = 500
+EPOCHS         = 100
+DROUPOUT       = 0.0
+K              = 1
+PROJ_DIM       = 20
+ORTHO_WEIGHT   = 5.0
+OUTPUT_DIR     = './embeddings/sdgnn-attention'
 
 
 
@@ -146,7 +142,7 @@ class AttentionAggregator(nn.Module):
         adj --- sp.csr_matrix
         """
         node_pku = np.array(nodes)
-        edges = np.array(adj[nodes, :].nonzero()).T
+        edges = np.array(adj[node_pku, :].nonzero()).T
         edges[:, 0] = node_pku[edges[:, 0]]
 
         unique_nodes_list = np.unique(np.hstack((np.unique(edges), np.array(nodes))))
@@ -233,11 +229,42 @@ class MeanAggregator(nn.Module):
 
 
 
+class OrthogonalProjectionLayer(nn.Module):
+    """
+    Learnable linear projection from in_dim to out_dim (no bias), used to
+    project embeddings into a lower-dimensional orthogonal subspace for
+    sign prediction only.
+
+    Orthogonality is encouraged via a soft penalty added to the training loss:
+        L_o = ||W W^T - I||_F^2        (Bousmalis et al., 2016;
+                                         Brock et al., 2017;
+                                         Vorontsov et al., 2017)
+    where W is the weight matrix (out_dim x in_dim) and I is the
+    (out_dim x out_dim) identity matrix.
+
+    The weight is initialised with nn.init.orthogonal_ so training starts
+    from a feasible point on the Stiefel manifold (L_o = 0 at epoch 0).
+    Call model.orthogonality_loss() and add λ * L_o to the task loss.
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super(OrthogonalProjectionLayer, self).__init__()
+        self.projection = nn.Linear(in_dim, out_dim, bias=False)
+        nn.init.orthogonal_(self.projection.weight)
+
+    def forward(self, x):
+        return self.projection(x)
+
+
 class SDGNN(nn.Module):
 
-    def __init__(self, enc):
+    def __init__(self, enc, proj_dim=PROJ_DIM):
         super(SDGNN, self).__init__()
         self.enc = enc
+        # Orthogonal projection: maps EMBEDDING_SIZE1-dim embeddings → proj_dim
+        # Used ONLY in the sign loss (dot-product BCE).
+        self.proj = OrthogonalProjectionLayer(EMBEDDING_SIZE1, proj_dim)
+        # Direction and triangle/status losses still use raw EMBEDDING_SIZE1-dim embeddings.
         self.score_function1 = nn.Sequential(
             nn.Linear(EMBEDDING_SIZE1, 1),
             nn.Sigmoid()
@@ -250,18 +277,35 @@ class SDGNN(nn.Module):
 
     def forward(self, nodes):
         embeds = self.enc(nodes)
+        embeds = self.proj(embeds)   # project to proj_dim for evaluation/saving
         return embeds
+
+    def orthogonality_loss(self):
+        """
+        Soft orthogonality regularization penalty (Bousmalis et al., 2016):
+            L_o = ||W W^T - I||_F^2
+        where W is the projection weight matrix of shape (proj_dim, EMBEDDING_SIZE1).
+        Add λ * model.orthogonality_loss() to the task loss during training.
+        """
+        W = self.proj.projection.weight          # (proj_dim, embed_dim)
+        WWT = torch.mm(W, W.t())                 # (proj_dim, proj_dim)
+        I = torch.eye(WWT.size(0)).to(WWT.device)
+        return torch.norm(WWT - I, p='fro') ** 2
 
     def criterion(self, nodes, pos_neighbors, neg_neighbors, adj_lists1_1, adj_lists2_1, weight_dict):
         pos_neighbors_list = [set.union(pos_neighbors[i]) for i in nodes]
         neg_neighbors_list = [set.union(neg_neighbors[i]) for i in nodes]
         unique_nodes_list = list(set.union(*pos_neighbors_list).union(*neg_neighbors_list).union(nodes))
         unique_nodes_dict = {n: i for i, n in enumerate(unique_nodes_list)}
+        # Raw encoder embeddings: used by direction loss (fc) and triangle/status loss (score_functions)
         nodes_embs = self.enc(unique_nodes_list)
+        # Orthogonally projected embeddings: used ONLY by the sign loss (dot-product BCE)
+        nodes_embs_proj = self.proj(nodes_embs)
 
         loss_total = 0
         for index, node in enumerate(nodes):
-            z1 = nodes_embs[unique_nodes_dict[node], :]
+            z1      = nodes_embs[unique_nodes_dict[node], :]       # raw  — direction & triangle
+            z1_proj = nodes_embs_proj[unique_nodes_dict[node], :]  # proj — sign loss only
             pos_neigs = list([unique_nodes_dict[i] for i in pos_neighbors[node]])
             neg_neigs = list([unique_nodes_dict[i] for i in neg_neighbors[node]])
             pos_num = len(pos_neigs)
@@ -274,18 +318,21 @@ class SDGNN(nn.Module):
             neg_neigs_weight = torch.FloatTensor([weight_dict[node][i] for i in adj_lists2_1[node]]).to(DEVICES)
 
             if pos_num > 0:
-                pos_neig_embs = nodes_embs[pos_neigs, :]
-                loss_pku = F.binary_cross_entropy_with_logits(torch.einsum("nj,j->n", [pos_neig_embs, z1]),
-                                                              torch.ones(pos_num).to(DEVICES))
+                # --- Sign loss: projected embeddings ---
+                pos_neig_embs_proj = nodes_embs_proj[pos_neigs, :]
+                loss_pku = F.binary_cross_entropy_with_logits(
+                    torch.einsum("nj,j->n", [pos_neig_embs_proj, z1_proj]),
+                    torch.ones(pos_num).to(DEVICES))
 
                 if len(sta_pos_neighs) > 0:
+                    # --- Direction loss: raw embeddings ---
                     sta_pos_neig_embs = nodes_embs[sta_pos_neighs, :]
-
                     z11 = z1.repeat(len(sta_pos_neighs), 1)
                     rs = self.fc(torch.cat([z11, sta_pos_neig_embs], 1)).squeeze(-1)
                     loss_pku += F.binary_cross_entropy_with_logits(rs, torch.ones(len(sta_pos_neighs)).to(DEVICES), \
                                                                    weight=pos_neigs_weight
                                                                    )
+                    # --- Triangle/status loss: raw embeddings ---
                     s1 = self.score_function1(z1).repeat(len(sta_pos_neighs), 1)
                     s2 = self.score_function2(sta_pos_neig_embs)
 
@@ -296,18 +343,22 @@ class SDGNN(nn.Module):
                 loss_total += loss_pku
 
             if neg_num > 0:
-                neg_neig_embs = nodes_embs[neg_neigs, :]
-                loss_pku = F.binary_cross_entropy_with_logits(torch.einsum("nj,j->n", [neg_neig_embs, z1]),
-                                                              torch.zeros(neg_num).to(DEVICES))
-                if len(sta_neg_neighs) > 0:
-                    sta_neg_neig_embs = nodes_embs[sta_neg_neighs, :]
+                # --- Sign loss: projected embeddings ---
+                neg_neig_embs_proj = nodes_embs_proj[neg_neigs, :]
+                loss_pku = F.binary_cross_entropy_with_logits(
+                    torch.einsum("nj,j->n", [neg_neig_embs_proj, z1_proj]),
+                    torch.zeros(neg_num).to(DEVICES))
 
+                if len(sta_neg_neighs) > 0:
+                    # --- Direction loss: raw embeddings ---
+                    sta_neg_neig_embs = nodes_embs[sta_neg_neighs, :]
                     z12 = z1.repeat(len(sta_neg_neighs), 1)
                     rs = self.fc(torch.cat([z12, sta_neg_neig_embs], 1)).squeeze(-1)
 
                     loss_pku += F.binary_cross_entropy_with_logits(rs, torch.zeros(len(sta_neg_neighs)).to(DEVICES), \
                                                                    weight=neg_neigs_weight)
 
+                    # --- Triangle/status loss: raw embeddings ---
                     s1 = self.score_function1(z1).repeat(len(sta_neg_neighs), 1)
                     s2 = self.score_function2(sta_neg_neig_embs)
 
@@ -434,7 +485,7 @@ def run(dataset, k):
     aggs2 = [aggregator(lambda n: enc1(n), EMBEDDING_SIZE1, EMBEDDING_SIZE1, num_nodes) for _ in adj_lists]
     enc2 = Encoder(lambda n: enc1(n), EMBEDDING_SIZE1, EMBEDDING_SIZE1, adj_lists, aggs2)
 
-    model = SDGNN(enc2)
+    model = SDGNN(enc2, proj_dim=PROJ_DIM)
     model = model.to(DEVICES)
 
     print(model.train())
@@ -449,7 +500,7 @@ def run(dataset, k):
         total_loss = []
         if epoch % INTERVAL_PRINT == 0:
             model.eval()
-            all_embedding = np.zeros((NUM_NODE, EMBEDDING_SIZE1))
+            all_embedding = np.zeros((NUM_NODE, PROJ_DIM))
             for i in range(0, NUM_NODE, BATCH_SIZE):
                 begin_index = i
                 end_index = i + BATCH_SIZE if i + BATCH_SIZE < NUM_NODE else NUM_NODE
@@ -476,6 +527,7 @@ def run(dataset, k):
             loss = model.criterion(
                 nodes, adj_lists1, adj_lists2, adj_lists1_1, adj_lists2_1, weight_dict
             )
+            loss = loss + ORTHO_WEIGHT * model.orthogonality_loss()
             total_loss.append(loss.data.cpu().numpy())
 
             loss.backward()
@@ -483,6 +535,38 @@ def run(dataset, k):
         print(f'epoch: {epoch}, loss: {np.mean(total_loss)}, time: {time.time()-time1}')
 
 def main():
+    global NEG_LOSS_RATIO, INTERVAL_PRINT, NUM_NODE, WEIGHT_DECAY, NODE_FEAT_SIZE
+    global EMBEDDING_SIZE1, DEVICES, LEARNING_RATE, BATCH_SIZE, EPOCHS, DROUPOUT
+    global K, PROJ_DIM, ORTHO_WEIGHT, OUTPUT_DIR
+
+    args = parser.parse_args()
+
+    OUTPUT_DIR = f'./embeddings/sdgnn-{args.agg}'
+    os.makedirs('embeddings', exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    NUM_NODE      = DATASET_NUM_DIC[args.dataset]
+    WEIGHT_DECAY  = args.weight_decay
+    NODE_FEAT_SIZE= args.fea_dim
+    EMBEDDING_SIZE1= args.dim
+    DEVICES       = torch.device(args.devices)
+    LEARNING_RATE = args.lr
+    BATCH_SIZE    = args.batch_size
+    EPOCHS        = args.epochs
+    DROUPOUT      = args.dropout
+    K             = args.k
+    PROJ_DIM      = args.proj_dim
+    ORTHO_WEIGHT  = args.ortho_weight
+
+    assert PROJ_DIM <= EMBEDDING_SIZE1, (
+        f"proj_dim ({PROJ_DIM}) must be <= dim ({EMBEDDING_SIZE1}). "
+        f"Upward projection is unsupported."
+    )
+
     print('NUM_NODE', NUM_NODE)
     print('WEIGHT_DECAY', WEIGHT_DECAY)
     print('NODE_FEAT_SIZE', NODE_FEAT_SIZE)
@@ -491,8 +575,7 @@ def main():
     print('BATCH_SIZE', BATCH_SIZE)
     print('EPOCHS', EPOCHS)
     print('DROUPOUT', DROUPOUT)
-    dataset = args.dataset
-    run(dataset=dataset, k=K)
+    run(dataset=args.dataset, k=K)
 
 
 if __name__ == "__main__":
