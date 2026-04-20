@@ -439,17 +439,55 @@ print(f"  ✓  {p}")
 try:
     import plotly.graph_objects as go
     import plotly.io as pio
-    from dash import Dash, dcc, html, callback, Input, Output
-    import dash_bootstrap_components as dbc
     import pickle
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+try:
+    from dash import Dash, dcc, html, callback, Input, Output
+    import dash_bootstrap_components as dbc
+    DASH_AVAILABLE = True
+except ImportError:
+    DASH_AVAILABLE = False
+
 if PLOTLY_AVAILABLE:
-    print(f"Generating interactive Dash app → {args.out_dir}/app_interactive.py")
-    
-    dash_app_code = '''#!/usr/bin/env python3
+    print(f"Generating interactive HTML scatter → {args.out_dir}/proj_scatter_interactive.html")
+    scatter_html = go.Figure(
+        data=[go.Scatter(
+            x=emb[:, 0],
+            y=emb[:, 1],
+            mode='markers',
+            marker=dict(
+                size=8,
+                color=pos_ratio,
+                colorscale='RdYlGn',
+                colorbar=dict(title='Positive Edge Ratio'),
+                line=dict(width=0.3, color='#7f8c8d'),
+            ),
+            text=[
+                f"<b>{idx_to_label[i]}</b><br>degree={int(total_deg[i])}<br>"
+                f"pos_ratio={pos_ratio[i]:.2f}"
+                for i in range(N)
+            ],
+            hoverinfo='text',
+        )],
+        layout=go.Layout(
+            title='Interactive 2-D Projection — Positive Edge Ratio',
+            xaxis=dict(title='Proj. Dim 1'),
+            yaxis=dict(title='Proj. Dim 2'),
+            hovermode='closest',
+        )
+    )
+    html_path = os.path.join(args.out_dir, 'proj_scatter_interactive.html')
+    pio.write_html(scatter_html, file=html_path,
+                   full_html=True, include_plotlyjs='cdn')
+    print(f"  ✓  {html_path}")
+
+    if DASH_AVAILABLE:
+        print(f"Generating interactive Dash app → {args.out_dir}/app_interactive.py")
+        
+        dash_app_code = '''#!/usr/bin/env python3
 """Interactive Dash app for 2-D projection visualization with hover-based edges."""
 import numpy as np
 import pickle
@@ -592,34 +630,36 @@ if __name__ == '__main__':
     print("Press Ctrl+C to stop")
     app.run(debug=False, port=8050)
 '''
-    
-    app_file = os.path.join(args.out_dir, 'app_interactive.py')
-    with open(app_file, 'w') as f:
-        f.write(dash_app_code)
-    
-    # Save data for the Dash app
-    data_to_save = {
-        'emb': emb,
-        'idx_to_label': idx_to_label,
-        'total_deg': total_deg,
-        'pos_ratio': pos_ratio,
-        'adj_lists1_1': adj_lists1_1,
-        'adj_lists1_2': adj_lists1_2,
-        'adj_lists2_1': adj_lists2_1,
-        'adj_lists2_2': adj_lists2_2,
-        'N': N,
-    }
-    data_file = os.path.join(args.out_dir, 'proj_data.pkl')
-    with open(data_file, 'wb') as f:
-        pickle.dump(data_to_save, f)
-    
-    print(f"  ✓  {app_file}")
-    print(f"  ✓  {data_file}")
-    print(f"\n  To run the interactive app:")
-    print(f"    cd {args.out_dir}")
-    print(f"    python app_interactive.py")
+        
+        app_file = os.path.join(args.out_dir, 'app_interactive.py')
+        with open(app_file, 'w') as f:
+            f.write(dash_app_code)
+        
+        # Save data for the Dash app
+        data_to_save = {
+            'emb': emb,
+            'idx_to_label': idx_to_label,
+            'total_deg': total_deg,
+            'pos_ratio': pos_ratio,
+            'adj_lists1_1': adj_lists1_1,
+            'adj_lists1_2': adj_lists1_2,
+            'adj_lists2_1': adj_lists2_1,
+            'adj_lists2_2': adj_lists2_2,
+            'N': N,
+        }
+        data_file = os.path.join(args.out_dir, 'proj_data.pkl')
+        with open(data_file, 'wb') as f:
+            pickle.dump(data_to_save, f)
+        
+        print(f"  ✓  {app_file}")
+        print(f"  ✓  {data_file}")
+        print(f"\n  To run the interactive app:")
+        print(f"    cd {args.out_dir}")
+        print(f"    python app_interactive.py")
+    else:
+        print("Dash not installed; skipping interactive Dash app.")
 else:
-    print("Plotly/Dash not installed; skipping interactive app.")
+    print("Plotly not installed; skipping interactive HTML scatter and Dash app.")
 
 edges_list = [
     (node_map[row[FROM_COL]], node_map[row[TO_COL]], int(row['sign']))
@@ -818,6 +858,8 @@ out_files = ['proj_scatter.png', 'proj_extreme.png', 'proj_edges.png',
 if args.proj_dim >= 3:
     out_files.append('proj_3d.png')
 if PLOTLY_AVAILABLE:
+    out_files.append('proj_scatter_interactive.html')
+if DASH_AVAILABLE:
     out_files.append('app_interactive.py (+ proj_data.pkl)')
 print(f"\n✓  All figures saved to ./{args.out_dir}/")
 print(f"   {' · '.join(out_files)}")
