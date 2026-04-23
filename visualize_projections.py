@@ -149,6 +149,30 @@ node_map     = {name: i for i, name in enumerate(all_labels)}
 idx_to_label = {i: name for name, i in node_map.items()}
 print(f"  {N} unique nodes")
 
+# Filter out nodes with degree <= 2 before embedding.
+# Keep only nodes that remain in the 2-core of the signed graph.
+keep_labels = set(all_labels)
+while True:
+    deg_counts = defaultdict(int)
+    for _, row in df[df[FROM_COL].isin(keep_labels) &
+                    df[TO_COL].isin(keep_labels)].iterrows():
+        deg_counts[row[FROM_COL]] += 1
+        deg_counts[row[TO_COL]] += 1
+
+    to_remove = {label for label in keep_labels if deg_counts[label] <= 2}
+    if not to_remove:
+        break
+    keep_labels -= to_remove
+
+if len(keep_labels) != len(all_labels):
+    print(f"Filtering {len(all_labels) - len(keep_labels)} nodes with degree <= 2 before embedding")
+    df = df[df[FROM_COL].isin(keep_labels) & df[TO_COL].isin(keep_labels)].copy()
+    all_labels = sorted(keep_labels)
+    N = len(all_labels)
+    node_map = {name: i for i, name in enumerate(all_labels)}
+    idx_to_label = {i: name for name, i in node_map.items()}
+    print(f"  {N} unique nodes remain after filtering")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 · Build adjacency structures (same format as sdgnn.load_data2 / sdgnn.run)
 #
@@ -814,7 +838,153 @@ plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
 print(f"  ✓  {p}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Figure 6 — proj_3d.png  (only when proj_dim ≥ 3)
+# Figure 6 — proj_angular.png
+#
+# The sign loss uses the dot product  z_u · z_v  as the prediction logit, so
+# the geometry is ANGULAR (inner-product), not Euclidean.
+# Positive pairs should be directionally aligned (cos θ > 0);
+# negative pairs should point in roughly opposite directions (cos θ < 0).
+#
+# Three panels (2-D case):
+#   (a) Unit circle — nodes projected to unit sphere, edges as chords
+#   (b) Cosine similarity histogram — P(positive) vs P(negative) | cos θ
+#   (c) Polar angle θ vs positive-ratio scatter (only proj_dim == 2)
+#
+# For proj_dim > 2 only panel (b) is produced.
+# ─────────────────────────────────────────────────────────────────────────────
+emb_norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
+emb_unit  = emb / emb_norms          # (N, proj_dim) unit vectors
+
+# Compute per-edge cosine similarities
+cos_pos, cos_neg = [], []
+for u, v, sign in edges_list:
+    c = float(np.dot(emb_unit[u], emb_unit[v]))
+    if sign == 1:
+        cos_pos.append(c)
+    else:
+        cos_neg.append(c)
+cos_pos = np.array(cos_pos)
+cos_neg = np.array(cos_neg)
+
+if args.proj_dim == 2:
+    fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+    fig.suptitle(
+        'Angular Geometry of the Orthogonal Projection Space\n'
+        r'Sign loss: $\hat{y}_{uv} = \sigma(z_u \cdot z_v)$  — '
+        r'alignment ($\cos\theta > 0$) $\Rightarrow$ positive, '
+        r'opposition ($\cos\theta < 0$) $\Rightarrow$ negative',
+        fontsize=11, fontweight='bold', y=1.02)
+
+    # ── (a) Unit circle ──────────────────────────────────────────────────────
+    ax = axes[0]
+    theta_circle = np.linspace(0, 2 * np.pi, 300)
+    ax.plot(np.cos(theta_circle), np.sin(theta_circle),
+            color='#bdc3c7', lw=1.2, zorder=0)
+
+    # Sample edges as chords
+    n_chord = min(400, len(edges_list))
+    sample_chord = random.sample(edges_list, n_chord)
+    for u, v, sign in sample_chord:
+        ax.plot([emb_unit[u, 0], emb_unit[v, 0]],
+                [emb_unit[u, 1], emb_unit[v, 1]],
+                color=GREEN if sign == 1 else RED,
+                alpha=0.12, lw=0.7, zorder=1)
+
+    # Nodes coloured by positive-ratio
+    sc = ax.scatter(emb_unit[:, 0], emb_unit[:, 1],
+                    c=pos_ratio, cmap=CMAP_SIGN, norm=norm_ratio,
+                    s=28, alpha=0.85, linewidths=0.3,
+                    edgecolors='#7f8c8d', zorder=2)
+    plt.colorbar(sc, ax=ax, label='Positive ratio', shrink=0.75, pad=0.02)
+
+    # Label highest-degree nodes
+    for i in np.argsort(total_deg)[-min(15, args.label_top):]:
+        ax.annotate(_short(idx_to_label[i]),
+                    (emb_unit[i, 0], emb_unit[i, 1]),
+                    fontsize=6, ha='center', va='bottom',
+                    xytext=(0, 4), textcoords='offset points', color='#2c3e50')
+
+    ax.set_aspect('equal')
+    ax.set_xlim(-1.25, 1.25); ax.set_ylim(-1.25, 1.25)
+    ax.set_title('Unit Circle — nodes normalised to ‖z‖ = 1\n'
+                 'Chords: green = positive, red = negative', fontsize=10)
+    ax.set_xlabel('Proj. Dim 1 (unit)'); ax.set_ylabel('Proj. Dim 2 (unit)')
+    ax.legend(handles=[
+        Line2D([0], [0], color=GREEN, lw=2, label='Positive chord'),
+        Line2D([0], [0], color=RED,   lw=2, label='Negative chord'),
+    ], fontsize=8, loc='upper right', framealpha=0.9)
+
+    # ── (b) Cosine similarity histogram ──────────────────────────────────────
+    ax = axes[1]
+    bins = np.linspace(-1, 1, 41)
+    ax.hist(cos_pos, bins=bins, color=GREEN, alpha=0.65,
+            label=f'Positive edges  (n={len(cos_pos):,})', density=True)
+    ax.hist(cos_neg, bins=bins, color=RED,   alpha=0.65,
+            label=f'Negative edges  (n={len(cos_neg):,})', density=True)
+    ax.axvline(0, color='#2c3e50', ls='--', lw=1.2,
+               label='cos θ = 0  (90° boundary)')
+    ax.axvline(np.mean(cos_pos), color=GREEN, ls=':', lw=1.5,
+               label=f'Mean pos = {np.mean(cos_pos):.3f}')
+    ax.axvline(np.mean(cos_neg), color=RED,   ls=':', lw=1.5,
+               label=f'Mean neg = {np.mean(cos_neg):.3f}')
+    ax.set_xlabel(r'Cosine similarity  $\cos\theta_{uv} = \hat{z}_u \cdot \hat{z}_v$')
+    ax.set_ylabel('Density')
+    ax.set_title('Angular Separation by Edge Sign\n'
+                 r'$\cos\theta > 0$ → positive, $\cos\theta < 0$ → negative',
+                 fontsize=10)
+    ax.legend(fontsize=8, framealpha=0.9); ax.grid(True, alpha=0.3)
+
+    # ── (c) Polar angle θ vs positive-ratio ──────────────────────────────────
+    ax = axes[2]
+    theta_nodes = np.degrees(np.arctan2(emb_unit[:, 1], emb_unit[:, 0]))
+    sc2 = ax.scatter(theta_nodes, pos_ratio,
+                     c=log_deg, cmap=CMAP_DEG,
+                     s=30, alpha=0.75, linewidths=0.3, edgecolors='#7f8c8d')
+    plt.colorbar(sc2, ax=ax, label='log(1 + degree)', shrink=0.75, pad=0.02)
+    # Annotate high-degree nodes
+    for i in np.argsort(total_deg)[-min(15, args.label_top):]:
+        ax.annotate(_short(idx_to_label[i]),
+                    (theta_nodes[i], pos_ratio[i]),
+                    fontsize=6, ha='center', va='bottom',
+                    xytext=(0, 4), textcoords='offset points', color='#2c3e50')
+    ax.axhline(0.5, color='#7f8c8d', ls='--', lw=1, label='Neutral ratio = 0.5')
+    ax.set_xlabel('Polar angle θ = atan2(z₂, z₁)  [degrees]')
+    ax.set_ylabel('Positive edge ratio')
+    ax.set_title('Polar Angle vs Sentiment Profile\n'
+                 'Nodes at similar θ share similar sentiment orientation',
+                 fontsize=10)
+    ax.legend(fontsize=8, framealpha=0.9); ax.grid(True, alpha=0.3)
+
+else:
+    # For proj_dim != 2: only the cosine similarity histogram
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(
+        'Angular Separation by Edge Sign\n'
+        r'$\hat{y}_{uv} = \sigma(z_u \cdot z_v)$ — '
+        r'$\cos\theta > 0 \Rightarrow$ positive, $\cos\theta < 0 \Rightarrow$ negative',
+        fontsize=11, fontweight='bold')
+    bins = np.linspace(-1, 1, 41)
+    ax.hist(cos_pos, bins=bins, color=GREEN, alpha=0.65,
+            label=f'Positive edges  (n={len(cos_pos):,})', density=True)
+    ax.hist(cos_neg, bins=bins, color=RED,   alpha=0.65,
+            label=f'Negative edges  (n={len(cos_neg):,})', density=True)
+    ax.axvline(0, color='#2c3e50', ls='--', lw=1.2,
+               label='cos θ = 0  (90° boundary)')
+    ax.axvline(np.mean(cos_pos), color=GREEN, ls=':', lw=1.5,
+               label=f'Mean pos = {np.mean(cos_pos):.3f}')
+    ax.axvline(np.mean(cos_neg), color=RED,   ls=':', lw=1.5,
+               label=f'Mean neg = {np.mean(cos_neg):.3f}')
+    ax.set_xlabel(r'Cosine similarity  $\cos\theta_{uv} = \hat{z}_u \cdot \hat{z}_v$')
+    ax.set_ylabel('Density')
+    ax.legend(fontsize=9, framealpha=0.9); ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+p = os.path.join(args.out_dir, 'proj_angular.png')
+plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
+print(f"  ✓  {p}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 7 — proj_3d.png  (only when proj_dim ≥ 3)
 # ─────────────────────────────────────────────────────────────────────────────
 if args.proj_dim >= 3:
     fig  = plt.figure(figsize=(10, 8))
@@ -853,8 +1023,9 @@ print(f"\nTop-5 most negatively perceived:")
 for i in sort_ord[:5]:
     print(f"  {active_ratios[i]:.3f}  {active_labels[i]}  (deg={active_deg[i]})")
 
-out_files = ['proj_scatter.png', 'proj_extreme.png', 'proj_edges.png', 
-             'training_curves.png', 'sentiment_analysis.png', 'projection_matrix.png']
+out_files = ['proj_scatter.png', 'proj_extreme.png', 'proj_edges.png',
+             'training_curves.png', 'sentiment_analysis.png',
+             'projection_matrix.png', 'proj_angular.png']
 if args.proj_dim >= 3:
     out_files.append('proj_3d.png')
 if PLOTLY_AVAILABLE:
