@@ -35,8 +35,11 @@ Usage
     python visualize_projections.py --proj_dim 3 --epochs 60 --agg mean
 """
 
+import difflib
 import os
 import random
+import re
+import unicodedata
 from collections import defaultdict
 
 import numpy as np
@@ -70,7 +73,9 @@ import argparse
 parser = argparse.ArgumentParser(
     description='Visualise SDGNN Orthogonal Projections for the  edgelist')
 parser.add_argument('--csv',
-    default='experiment-data/edgelist_v3_2025H2_2026H1.csv')
+    default='experiment-data/edgelist_fixed.csv')
+parser.add_argument('--party_csv', default='experiment-data/congress_matched.csv',
+    help='Optional node metadata CSV with party labels (node_name,node_id,partido)')
 parser.add_argument('--out_dir',      default='visualizations')
 parser.add_argument('--proj_dim',     type=int,   default=2,
     help='Dimension of the orthogonal projection (2 → 2-D, ≥3 → also 3-D)')
@@ -78,7 +83,7 @@ parser.add_argument('--embed_dim',    type=int,   default=20,
     help='Encoder embedding dimension (EMBEDDING_SIZE1 in sdgnn)')
 parser.add_argument('--feat_dim',     type=int,   default=20,
     help='Node feature dimension (NODE_FEAT_SIZE in sdgnn)')
-parser.add_argument('--epochs',       type=int,   default=50)
+parser.add_argument('--epochs',       type=int,   default=30)
 parser.add_argument('--batch_size',   type=int,   default=128)
 parser.add_argument('--lr',           type=float, default=5e-3)
 parser.add_argument('--ortho_weight', type=float, default=5.0,
@@ -90,7 +95,10 @@ parser.add_argument('--agg',          default='attention',
     help='Aggregator type — mirrors sdgnn.py --agg')
 parser.add_argument('--label_top',    type=int,   default=200)
 parser.add_argument('--max_edges',    type=int,   default=400)
-parser.add_argument('--min_degree',   type=int,   default=5)
+parser.add_argument('--min_degree',   type=int,   default=5,
+    help='Minimum degree for nodes shown in analysis and filtering outputs')
+parser.add_argument('--min_core_degree', type=int, default=5,
+    help='Filter out nodes with degree <= this value before embedding')
 parser.add_argument('--seed',         type=int,   default=42)
 parser.add_argument('--device',       default='cpu')
 args = parser.parse_args()
@@ -134,23 +142,125 @@ TO_COL   = 'to_node_label'
 SIGN_COL = 'sentiment'
 
 sign_map = {'positive': 1, 'negative': -1}
+VALID_SENTIMENTS = {'positive', 'negative', 'neutral'}
+
 df[FROM_COL] = df[FROM_COL].astype(str).str.strip()
 df[TO_COL]   = df[TO_COL].astype(str).str.strip()
+
+# Drop malformed rows where the sentiment column contains description text
+# instead of a valid sentiment label (column shift in the CSV).
+n_before = len(df)
+df = df[df[SIGN_COL].isin(VALID_SENTIMENTS)].copy()
+n_dropped = n_before - len(df)
+if n_dropped:
+    print(f"  Dropped {n_dropped:,} malformed rows (sentiment column contained description text)")
+
+df = df[df[FROM_COL] != df[TO_COL]]      # remove self-loops
+
+# Separate neutral edges BEFORE dropping them — kept for graph structure only,
+# not used in the sign-prediction loss.
+df_neutral = df[df[SIGN_COL] == 'neutral'].copy()
 df = df[df[SIGN_COL].isin(sign_map)].copy()
 df['sign'] = df[SIGN_COL].map(sign_map).astype(int)
-df = df[df[FROM_COL] != df[TO_COL]]      # remove self-loops
-print(f"  After filtering: {len(df):,} edges "
-      f"({df['sign'].eq(1).sum():,} pos, {df['sign'].eq(-1).sum():,} neg)")
+print(f"  After filtering: {len(df):,} signed edges "
+      f"({df['sign'].eq(1).sum():,} pos, {df['sign'].eq(-1).sum():,} neg)"
+      f"  +  {len(df_neutral):,} neutral edges (structure only)")
 
 # Integer node mapping  (politician label → integer ID)
-all_labels   = sorted(set(df[FROM_COL]) | set(df[TO_COL]))
+# Include nodes that appear only in neutral edges so they get embeddings.
+all_labels   = sorted(set(df[FROM_COL]) | set(df[TO_COL])
+                      | set(df_neutral[FROM_COL]) | set(df_neutral[TO_COL]))
 N            = len(all_labels)
 node_map     = {name: i for i, name in enumerate(all_labels)}
 idx_to_label = {i: name for name, i in node_map.items()}
 print(f"  {N} unique nodes")
 
-# Filter out nodes with degree <= 2 before embedding.
-# Keep only nodes that remain in the 2-core of the signed graph.
+def _normalize_text(value):
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r'[^a-z0-9 ]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s or None
+
+
+def _best_party_for_label(label, party_name_map):
+    norm_label = _normalize_text(label)
+    if not norm_label:
+        return None
+    # Skip obvious non-person strings: more than 5 tokens is almost certainly
+    # an organization name, a quote, or a collective noun — not a politician.
+    if len(norm_label.split()) > 5:
+        return None
+    # 1. Exact match
+    if norm_label in party_name_map:
+        return party_name_map[norm_label]
+    # 2. Fuzzy character-level match (handles accents, typos)
+    best = difflib.get_close_matches(norm_label, party_name_map.keys(), n=1,
+                                     cutoff=0.78)
+    if best:
+        return party_name_map[best[0]]
+    # 3. Substring containment — only if the label is short (≤ 3 tokens)
+    #    to avoid "Gobierno de Gabriel Boric" → "gabriel boric" → Independiente
+    if len(norm_label.split()) <= 3:
+        for key in party_name_map:
+            if key in norm_label or norm_label in key:
+                return party_name_map[key]
+    # 4. Token subset: all tokens of the shorter name appear in the longer name
+    #    e.g. "jose kast" matches "jose antonio kast"
+    label_tokens = set(norm_label.split())
+    for key in party_name_map:
+        key_tokens = set(key.split())
+        shorter, longer = (
+            (label_tokens, key_tokens) if len(label_tokens) <= len(key_tokens)
+            else (key_tokens, label_tokens)
+        )
+        if len(shorter) >= 2 and shorter.issubset(longer):
+            return party_name_map[key]
+    return None
+
+
+# Load party metadata for node colouring if available
+party_name_map = {}
+if args.party_csv:
+    try:
+        party_df = pd.read_csv(args.party_csv)
+        # Prefer the 'bloc' column; fall back to 'partido' for compatibility
+        party_df = party_df.rename(columns={
+            'Bloc': 'bloc', 'bloc': 'bloc',
+            'Partido': 'partido', 'partido': 'partido',
+            'node_name': 'node_name', 'node_id': 'node_id',
+            'cong_name': 'cong_name',
+        })
+        for _, row in party_df.iterrows():
+            # prefer bloc, then partido
+            partido = None
+            if 'bloc' in row:
+                partido = row.get('bloc')
+            if (pd.isna(partido) or partido == '') and 'partido' in row:
+                partido = row.get('partido')
+            if pd.isna(partido) or partido == '':
+                continue
+            partido = str(partido).strip()
+            if not partido:
+                continue
+
+            for col in ('cong_name', 'node_name'):
+                name = _normalize_text(row.get(col))
+                if name:
+                    party_name_map[name] = partido
+    except FileNotFoundError:
+        print(f"Warning: party CSV not found: {args.party_csv}")
+    except Exception as exc:
+        print(f"Warning: failed to load party CSV {args.party_csv}: {exc}")
+
+# Filter out nodes with degree <= min_core_degree before embedding.
+# Keep only nodes that remain in the k-core of the signed graph.
 keep_labels = set(all_labels)
 while True:
     deg_counts = defaultdict(int)
@@ -159,19 +269,34 @@ while True:
         deg_counts[row[FROM_COL]] += 1
         deg_counts[row[TO_COL]] += 1
 
-    to_remove = {label for label in keep_labels if deg_counts[label] <= 2}
+    to_remove = {label for label in keep_labels if deg_counts[label] <= args.min_core_degree}
     if not to_remove:
         break
     keep_labels -= to_remove
 
 if len(keep_labels) != len(all_labels):
-    print(f"Filtering {len(all_labels) - len(keep_labels)} nodes with degree <= 2 before embedding")
+    print(f"Filtering {len(all_labels) - len(keep_labels)} nodes with degree <= {args.min_core_degree} before embedding")
     df = df[df[FROM_COL].isin(keep_labels) & df[TO_COL].isin(keep_labels)].copy()
     all_labels = sorted(keep_labels)
     N = len(all_labels)
     node_map = {name: i for i, name in enumerate(all_labels)}
     idx_to_label = {i: name for name, i in node_map.items()}
     print(f"  {N} unique nodes remain after filtering")
+
+# Recompute party labels for the filtered node set.
+party_labels = np.array(['Unknown'] * N, dtype=object)
+if party_name_map:
+    for i, label in idx_to_label.items():
+        party = _best_party_for_label(label, party_name_map)
+        if party:
+            party_labels[i] = party
+
+# Debug: show party label distribution
+from collections import Counter
+_label_counts = Counter(party_labels)
+print("  Party label distribution (top 15):")
+for _lbl, _cnt in _label_counts.most_common(15):
+    print(f"    {_lbl!r}: {_cnt}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 · Build adjacency structures (same format as sdgnn.load_data2 / sdgnn.run)
@@ -185,31 +310,108 @@ if len(keep_labels) != len(all_labels):
 #   weight_dict  : motif weights (1.0 — FeaExtra is dataset-specific)
 # ─────────────────────────────────────────────────────────────────────────────
 print("Building adjacency structures …")
+
+# ── Step 1: accumulate per-sign counts for every directed (u, v) pair ────────
+# pos_counts[u][v] = number of positive interactions u → v
+# neg_counts[u][v] = number of negative interactions u → v
+pos_counts = defaultdict(lambda: defaultdict(int))
+neg_counts = defaultdict(lambda: defaultdict(int))
+
+for _, row in df.iterrows():
+    u = node_map[row[FROM_COL]]
+    v = node_map[row[TO_COL]]
+    if int(row['sign']) == 1:
+        pos_counts[u][v] += 1
+    else:
+        neg_counts[u][v] += 1
+
+# ── Step 2: resolve each (u, v) to a single sign via weighted majority ────────
+# All unique directed pairs that appear in at least one signed edge
+all_pairs = set()
+for u, neighbors in pos_counts.items():
+    for v in neighbors: all_pairs.add((u, v))
+for u, neighbors in neg_counts.items():
+    for v in neighbors: all_pairs.add((u, v))
+
+# Total interaction count per pair (pos + neg) — used for log-normalised weight
+edge_counts = defaultdict(lambda: defaultdict(int))
+for u, v in all_pairs:
+    edge_counts[u][v] = pos_counts[u][v] + neg_counts[u][v]
+
+# Log-normalised weight: w(u,v) = log(1 + total_count) / log(1 + max_count)
+_max_count = max(
+    (c for neighbors in edge_counts.values() for c in neighbors.values()),
+    default=1
+)
+_log_max = np.log1p(_max_count)
+
+def _lognorm(count):
+    return np.log1p(count) / _log_max
+
+# Weighted majority: positive wins if Σw(pos edges) > Σw(neg edges)
+# i.e. log(1+pos_count) > log(1+neg_count)  ⟺  pos_count > neg_count
+# (log is monotone, so this simplifies to raw count comparison — but we keep
+#  the log form for clarity and future flexibility)
+n_resolved_pos = n_resolved_neg = n_ties = 0
+resolved_sign = {}   # (u, v) → +1 or -1
+for u, v in all_pairs:
+    w_pos = np.log1p(pos_counts[u][v])
+    w_neg = np.log1p(neg_counts[u][v])
+    if w_pos >= w_neg:          # ties go to positive (more charitable)
+        resolved_sign[(u, v)] = 1
+        n_resolved_pos += 1
+    else:
+        resolved_sign[(u, v)] = -1
+        n_resolved_neg += 1
+
+n_ties = sum(1 for (u,v) in all_pairs
+             if pos_counts[u][v] == neg_counts[u][v] and pos_counts[u][v] > 0)
+print(f"  Weighted-majority sign resolution: "
+      f"{n_resolved_pos:,} positive, {n_resolved_neg:,} negative  "
+      f"({n_ties} ties → positive)")
+
+# ── Step 3: build adjacency lists from resolved signs ────────────────────────
 adj_lists1   = defaultdict(set)
 adj_lists1_1 = defaultdict(set)
 adj_lists1_2 = defaultdict(set)
 adj_lists2   = defaultdict(set)
 adj_lists2_1 = defaultdict(set)
 adj_lists2_2 = defaultdict(set)
-weight_dict  = defaultdict(dict)
+# Neutral edges: two directed channels (out / in) used only by the encoder,
+# never by the sign-prediction loss.
+adj_lists3_1 = defaultdict(set)   # neutral  u → v
+adj_lists3_2 = defaultdict(set)   # neutral  v ← u
 
-for _, row in df.iterrows():
-    u = node_map[row[FROM_COL]]
-    v = node_map[row[TO_COL]]
-    s = int(row['sign'])
-    if s == 1:
+for (u, v), sign in resolved_sign.items():
+    if sign == 1:
         adj_lists1[u].add(v);   adj_lists1[v].add(u)
         adj_lists1_1[u].add(v); adj_lists1_2[v].add(u)
     else:
         adj_lists2[u].add(v);   adj_lists2[v].add(u)
         adj_lists2_1[u].add(v); adj_lists2_2[v].add(u)
 
-# Uniform motif weights (FeaExtra not available for this dataset)
-for u in range(N):
-    for v in adj_lists1_1[u]:
-        weight_dict[u][v] = 1.0
-    for v in adj_lists2_1[u]:
-        weight_dict[u][v] = 1.0
+# Add neutral edges to the graph structure (structure only — not in loss)
+for _, row in df_neutral.iterrows():
+    u_lbl, v_lbl = row[FROM_COL], row[TO_COL]
+    if u_lbl not in node_map or v_lbl not in node_map:
+        continue
+    u = node_map[u_lbl]
+    v = node_map[v_lbl]
+    adj_lists3_1[u].add(v)
+    adj_lists3_2[v].add(u)
+
+n_neutral_edges = sum(len(vs) for vs in adj_lists3_1.values())
+print(f"  Neutral edges added to encoder graph: {n_neutral_edges:,} directed arcs")
+
+# ── Step 4: log-normalised weight dict ───────────────────────────────────────
+_min_weight = _lognorm(1)
+weight_dict = defaultdict(dict)
+for u, neighbors in edge_counts.items():
+    for v, count in neighbors.items():
+        weight_dict[u][v] = _lognorm(count)
+
+print(f"  Edge weights: log-normalised, max_count={_max_count}, "
+      f"range [{_min_weight:.3f}, 1.000]")
 
 # Convert directed adj_lists → scipy sparse matrices for sdgnn.Encoder
 # Same transformation as sdgnn.run()'s inner `func` helper.
@@ -221,8 +423,11 @@ def _to_csr(adj_dict: dict, n: int) -> sp.csr_matrix:
     return sp.csr_matrix(
         (np.ones(len(edges)), (rows, cols)), shape=(n, n))
 
+# 6 adjacency channels: pos-out, pos-in, neg-out, neg-in, neutral-out, neutral-in
 adj_sparse = [_to_csr(d, N)
-              for d in (adj_lists1_1, adj_lists1_2, adj_lists2_1, adj_lists2_2)]
+              for d in (adj_lists1_1, adj_lists1_2,
+                        adj_lists2_1, adj_lists2_2,
+                        adj_lists3_1, adj_lists3_2)]
 
 # Per-node statistics for visualisation
 pod       = np.array([len(adj_lists1_1[i]) for i in range(N)])
@@ -338,15 +543,115 @@ print("Training complete.")
 # 5 · Extract projected embeddings via model.forward() — sdgnn.SDGNN method
 #     forward() calls self.enc then self.proj; both defined in sdgnn.py
 # ─────────────────────────────────────────────────────────────────────────────
+LEFT_ANCHOR_NAMES = [
+    'Gabriel Boric', 'Camila Vallejo', 'Karol Cariola',
+    'Giorgio Jackson', 'Lautaro Carmona'
+]
+RIGHT_ANCHOR_NAMES = [
+    'José Antonio Kast', 'Juan Antonio Coloma', 'Evelyn Matthei',
+    'Sebastián Piñera', 'Iván Moreira'
+]
+
+
+def _find_indices_by_names(names):
+    wanted = {_normalize_text(name): name for name in names if _normalize_text(name)}
+    return [i for i, label in idx_to_label.items()
+            if _normalize_text(label) in wanted]
+
+
+def _anchor_projection(raw_emb, left_idx, right_idx):
+    """Return a 1-D projection that best separates left vs right anchors.
+
+    The axis is the (left_centroid - right_centroid) direction in the raw
+    embedding space, applied to mean-centered embeddings. Returns a
+    1-D numpy array of length N, or None on failure.
+    """
+    if len(left_idx) == 0 or len(right_idx) == 0:
+        return None
+    centered = raw_emb - raw_emb.mean(axis=0)
+    left_centroid = centered[left_idx].mean(axis=0)
+    right_centroid = centered[right_idx].mean(axis=0)
+    direction = left_centroid - right_centroid
+    norm = np.linalg.norm(direction)
+    if norm == 0:
+        return None
+    basis = direction / norm
+    return centered @ basis
+
 model.eval()
 with torch.no_grad():
     emb = model.forward(list(range(N))).cpu().numpy()   # (N, proj_dim)
+    raw_emb = model.enc(list(range(N))).cpu().numpy()   # (N, embed_dim)
 
 W_np      = model.proj.projection.weight.detach().cpu().numpy()   # (proj_dim, embed_dim)
 WWT       = W_np @ W_np.T
 I_        = np.eye(W_np.shape[0])
 ortho_err = float(np.linalg.norm(WWT - I_, 'fro'))
 print(f"\nEmbeddings : {emb.shape}  |  ||WW^T - I||_F = {ortho_err:.6f}")
+
+left_anchor_idx = _find_indices_by_names(LEFT_ANCHOR_NAMES)
+right_anchor_idx = _find_indices_by_names(RIGHT_ANCHOR_NAMES)
+anchor_emb = None
+if len(left_anchor_idx) > 0 and len(right_anchor_idx) > 0:
+    anchor_emb = _anchor_projection(raw_emb, left_anchor_idx, right_anchor_idx)
+    print(f"Anchor projection: {len(left_anchor_idx)} left anchors, {len(right_anchor_idx)} right anchors")
+else:
+    print("Anchor projection skipped: missing anchor labels")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LDA ideology probe
+# ─────────────────────────────────────────────────────────────────────────────
+# Assign a binary left/right label to every node that has a known bloc.
+# Left bloc:  PC, Frente Amplio, PS, PPD, PRSD, PH
+# Right bloc: UDI, RN, Republicano, Evopoli
+# LEFT_BLOCS  = {'pc', 'frente amplio', 'ps', 'ppd', 'prsd', 'ph'}
+# RIGHT_BLOCS = {'udi', 'rn', 'republicano', 'evopoli'}
+LEFT_BLOCS  = {'pc', 'ph', 'frente amplio'}
+RIGHT_BLOCS = {'udi', 'republicano'}
+
+lda_ideology   = None   # (N,) scores for all nodes — filled if LDA succeeds
+lda_coef       = None   # (embed_dim,) weight vector
+lda_score      = None   # held-out accuracy
+
+try:
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_score
+
+    # Build labelled set
+    lda_indices, lda_labels = [], []
+    for i, lbl in idx_to_label.items():
+        bloc_norm = _normalize_text(party_labels[i])
+        if bloc_norm in LEFT_BLOCS:
+            lda_indices.append(i)
+            lda_labels.append(0)   # 0 = left
+        elif bloc_norm in RIGHT_BLOCS:
+            lda_indices.append(i)
+            lda_labels.append(1)   # 1 = right
+
+    lda_indices = np.array(lda_indices)
+    lda_labels  = np.array(lda_labels)
+    n_left  = (lda_labels == 0).sum()
+    n_right = (lda_labels == 1).sum()
+    print(f"\nLDA ideology probe: {n_left} left nodes, {n_right} right nodes")
+
+    if min(n_left, n_right) >= 5:
+        X_lda = raw_emb[lda_indices]          # (n_labelled, embed_dim)
+        lda   = LinearDiscriminantAnalysis(n_components=1)
+        lda.fit(X_lda, lda_labels)
+
+        # Score via 5-fold CV
+        cv_scores  = cross_val_score(lda, X_lda, lda_labels, cv=min(5, min(n_left, n_right)), scoring='accuracy')
+        lda_score  = cv_scores.mean()
+
+        # Fit on full labelled set to get direction + scores for all nodes
+        lda_ideology = lda.transform(raw_emb).squeeze()   # (N,)
+        lda_coef     = lda.coef_.squeeze()                 # (embed_dim,)
+        print(f"LDA 5-fold CV accuracy: {lda_score:.3f}  |  ideology axis dim: {lda_coef.shape}")
+    else:
+        print("LDA skipped: not enough labelled nodes per side (need ≥ 5 each)")
+except ImportError:
+    print("LDA skipped: scikit-learn not available (pip install scikit-learn)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers for all figures
@@ -365,6 +670,23 @@ def _short(name: str, maxlen: int = 20) -> str:
     return (parts[0] + ' ' + parts[-1]) if len(parts) > 1 else name[:maxlen]
 
 
+def _clean_display_name(s: str) -> str:
+    """Return a human-friendly, trimmed display name for party labels.
+
+    Keeps original accents and capitalization where possible but collapses
+    weird whitespace and non-printable characters.
+    """
+    if s is None:
+        return 'Unknown'
+    t = str(s).strip()
+    # remove control / non-printable chars
+    t = ''.join(ch for ch in t if ch.isprintable())
+    # collapse inner whitespace
+    t = re.sub(r'\s+', ' ', t)
+    return t
+
+
+
 def _annotate_top(ax, xy, deg, top_n, fs=6):
     for i in np.argsort(deg)[-top_n:]:
         ax.annotate(_short(idx_to_label[i]), (xy[i, 0], xy[i, 1]),
@@ -377,7 +699,9 @@ def _annotate_top(ax, xy, deg, top_n, fs=6):
 # Figure 1 — proj_scatter.png  (3 colour-coded 2-D scatter panels)
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\nSaving figures → {args.out_dir}/")
-fig, axes = plt.subplots(1, 3, figsize=(20, 6.5))
+num_panels = 4 if anchor_emb is not None else 3
+fig_w = 24 if num_panels == 4 else 20
+fig, axes = plt.subplots(1, num_panels, figsize=(fig_w, 6.5))
 fig.suptitle(
     'SDGNN Orthogonal Projection — Chilean Political Sentiment Network\n'
     f'proj_dim={args.proj_dim}  embed_dim={args.embed_dim}  '
@@ -414,10 +738,205 @@ ax.set_title('Sentiment Profile\n(green=pos-majority, red=neg-majority)',
 ax.set_xlabel('Proj. Dim 1'); ax.set_ylabel('Proj. Dim 2')
 _annotate_top(ax, emb, total_deg, args.label_top)
 
+if anchor_emb is not None:
+    ax_anchor = axes[3]
+    # 1-D projection: plot along x with a small reproducible jitter on y
+    rng = np.random.RandomState(args.seed)
+    jitter = rng.normal(scale=0.02, size=anchor_emb.shape[0])
+    sc_anchor = ax_anchor.scatter(anchor_emb, jitter,
+                    c=pos_ratio, cmap=CMAP_SIGN, norm=norm_ratio,
+                    s=35, alpha=0.85, linewidths=0.3, edgecolors='#7f8c8d')
+    plt.colorbar(sc_anchor, ax=ax_anchor, label='Positive Edge Ratio', shrink=0.8, pad=0.01)
+    ax_anchor.set_title('Anchor-based 1-D Projection (Left vs Right)', fontsize=10)
+    ax_anchor.set_xlabel('Anchor axis (left ← right)')
+    ax_anchor.get_yaxis().set_visible(False)
+    # annotate anchor nodes at their x positions
+    for i in left_anchor_idx:
+        ax_anchor.annotate(_short(idx_to_label[i], maxlen=18),
+                    (anchor_emb[i], 0.03), fontsize=8, ha='center', va='bottom',
+                    color='#1f618d')
+    for i in right_anchor_idx:
+        ax_anchor.annotate(_short(idx_to_label[i], maxlen=18),
+                    (anchor_emb[i], 0.03), fontsize=8, ha='center', va='bottom',
+                    color='#922b21')
+
 plt.tight_layout()
 p = os.path.join(args.out_dir, 'proj_scatter.png')
 plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
 print(f"  ✓  {p}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 1a — proj_party.png  (2-D scatter by party membership)
+party_position_map = {
+    # Far left
+    'ph': -1.0,
+    'pc': -0.85,
+    'partido comunista de chile': -0.85,
+    # Left
+    'frente amplio': -0.75,
+    'revolucion democratica': -0.7,
+    'convergencia social': -0.7,
+    'ps': -0.6,
+    'partido socialista de chile': -0.6,
+    'ppd': -0.45,
+    'partido por la democracia': -0.45,
+    'izquierda ciudadana': -0.5,
+    'partido ecologista verde': -0.4,
+    'federacion regionalista verde social': -0.35,
+    # Centre-left
+    'prsd': -0.2,
+    'partido radical socialdemocrata': -0.2,
+    'partido liberal de chile': -0.15,
+    # Centre
+    'dc': 0.0,
+    'partido democrata cristiano': 0.0,
+    'independiente': 0.0,
+    'independientes': 0.0,
+    # Centre-right
+    'democratas': 0.2,
+    'partido de la gente': 0.25,
+    'partido social cristiano': 0.3,
+    'amplitud': 0.35,
+    'evopoli': 0.5,
+    'partido evolucion politica': 0.5,
+    # Right
+    'rn': 0.7,
+    'partido renovacion nacional': 0.7,
+    'udi': 0.85,
+    'partido union democrata independiente': 0.85,
+    # Far right
+    'republicano': 1.0,
+    'partido republicano': 1.0,
+    'partido nacional libertario': 0.95,
+}
+
+unique_parties = sorted(set(party_labels))
+if len(unique_parties) > 1 and any(p != 'Unknown' for p in unique_parties):
+    # Exclude 'Unknown' entirely from the party plot
+    known_party_order = [
+        'PH', 'PC', 'Frente Amplio', 'PS', 'PPD', 'PRSD', 'DC',
+        'Independientes', 'Demócratas', 'Evópoli', 'RN', 'UDI', 'Republicano'
+    ]
+    parties = []
+    for canonical in known_party_order:
+        match = next((p for p in unique_parties if _normalize_text(p) == _normalize_text(canonical)), None)
+        if match:
+            parties.append(match)
+    parties.extend([p for p in unique_parties
+                    if p != 'Unknown'
+                    and p not in parties
+                    and _normalize_text(p) in party_position_map])
+
+    norm = Normalize(vmin=-1.0, vmax=1.0)
+    cmap = plt.get_cmap('RdYlGn')
+    fig, ax = plt.subplots(figsize=(12, 10))
+    for party in parties:
+        mask = party_labels == party
+        if not np.any(mask):
+            continue
+        position = party_position_map.get(_normalize_text(party), 0.0)
+        display_name = _clean_display_name(party)
+        short_name = _short(display_name, maxlen=18)
+        ax.scatter(emb[mask, 0], emb[mask, 1], c=np.full(mask.sum(), position), cmap=cmap,
+                   norm=norm, s=45, alpha=0.85, linewidths=0.4,
+                   edgecolors='none', label=f"{short_name} ({mask.sum()})")
+
+    # Annotate specific well-known left/right politicians for clarity
+    left_names = [
+        'Gabriel Boric', 'Camila Vallejo', 'Karol Cariola',
+        'Giorgio Jackson', 'Lautaro Carmona'
+    ]
+    right_names = [
+        'José Antonio Kast', 'Juan Antonio Coloma', 'Evelyn Matthei',
+        'Sebastián Piñera', 'Iván Moreira'
+    ]
+
+    def _find_indices_by_names(names):
+        wanted = {(_normalize_text(n) or ''): n for n in names}
+        found = []
+        for i, lab in idx_to_label.items():
+            if lab is None:
+                continue
+            if _normalize_text(lab) in wanted:
+                found.append(i)
+        return found
+
+    left_idx = _find_indices_by_names(left_names)
+    right_idx = _find_indices_by_names(right_names)
+
+    for i in left_idx:
+        ax.annotate(_short(idx_to_label[i], maxlen=20), (emb[i, 0], emb[i, 1]),
+                    fontsize=8, ha='center', va='bottom', xytext=(0, 6),
+                    textcoords='offset points', color='#1f618d',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.85,
+                              ec='#1f618d', lw=0.6))
+
+    for i in right_idx:
+        ax.annotate(_short(idx_to_label[i], maxlen=20), (emb[i, 0], emb[i, 1]),
+                    fontsize=8, ha='center', va='bottom', xytext=(0, 6),
+                    textcoords='offset points', color='#922b21',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.85,
+                              ec='#922b21', lw=0.6))
+    ax.set_title('2-D Projection Colored by Party Position', fontsize=12)
+    ax.set_xlabel('Proj. Dim 1'); ax.set_ylabel('Proj. Dim 2')
+    # Place legend outside plot area so it isn't clipped when saving
+    # use multiple legend columns for many parties to avoid long vertical stacks
+    n_legend_cols = 1 if len(parties) <= 8 else (2 if len(parties) <= 16 else 3)
+    ax.legend(fontsize=9, framealpha=0.9, loc='upper left',
+              bbox_to_anchor=(1.02, 1), borderaxespad=0., ncol=n_legend_cols,
+              handlelength=1.5)
+    ax.grid(True, alpha=0.25)
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label('Party Position', rotation=270, labelpad=15)
+    plt.tight_layout()
+    p_party = os.path.join(args.out_dir, 'proj_party.png')
+    plt.savefig(p_party, dpi=150, bbox_inches='tight', pad_inches=0.08)
+    plt.close()
+    print(f"  ✓  {p_party}")
+
+    if anchor_emb is not None:
+        fig, ax = plt.subplots(figsize=(12, 8))
+        rng = np.random.RandomState(args.seed + 1)
+        jitter = rng.normal(scale=0.01, size=anchor_emb.shape[0])
+        for party in parties:
+            mask = party_labels == party
+            if not np.any(mask):
+                continue
+            position = party_position_map.get(_normalize_text(party), 0.0)
+            ax.scatter(anchor_emb[mask], jitter[mask], c=np.full(mask.sum(), position), cmap=cmap,
+                       norm=norm, s=45, alpha=0.85, linewidths=0.4,
+                       edgecolors='none', label=f"{_short(_clean_display_name(party), maxlen=18)} ({mask.sum()})")
+
+        for i in left_idx:
+            ax.annotate(_short(idx_to_label[i], maxlen=20), (anchor_emb[i], jitter[i] + 0.04),
+                        fontsize=8, ha='center', va='bottom', xytext=(0, 6),
+                        textcoords='offset points', color='#1f618d',
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.85,
+                                  ec='#1f618d', lw=0.6))
+        for i in right_idx:
+            ax.annotate(_short(idx_to_label[i], maxlen=20), (anchor_emb[i], jitter[i] + 0.04),
+                        fontsize=8, ha='center', va='bottom', xytext=(0, 6),
+                        textcoords='offset points', color='#922b21',
+                        bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.85,
+                                  ec='#922b21', lw=0.6))
+
+        ax.set_title('1-D Anchor Projection Colored by Party Position', fontsize=12)
+        ax.set_xlabel('Anchor axis (left ← right)')
+        ax.get_yaxis().set_visible(False)
+        ax.grid(True, axis='x', alpha=0.25)
+        n_legend_cols = 1 if len(parties) <= 8 else (2 if len(parties) <= 16 else 3)
+        ax.legend(fontsize=9, framealpha=0.9, loc='upper left',
+                  bbox_to_anchor=(1.02, 1), borderaxespad=0., ncol=n_legend_cols,
+                  handlelength=1.5)
+        plt.tight_layout()
+        p_party_1d = os.path.join(args.out_dir, 'proj_party_1d.png')
+        plt.savefig(p_party_1d, dpi=150, bbox_inches='tight', pad_inches=0.08)
+        plt.close()
+        print(f"  ✓  {p_party_1d}")
+else:
+    print("Skipping party-coloured plot: no valid party labels found.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Figure 1b — proj_extreme.png  (highest-degree nodes)
@@ -477,36 +996,127 @@ except ImportError:
 
 if PLOTLY_AVAILABLE:
     print(f"Generating interactive HTML scatter → {args.out_dir}/proj_scatter_interactive.html")
-    scatter_html = go.Figure(
-        data=[go.Scatter(
-            x=emb[:, 0],
-            y=emb[:, 1],
-            mode='markers',
-            marker=dict(
-                size=8,
-                color=pos_ratio,
-                colorscale='RdYlGn',
-                colorbar=dict(title='Positive Edge Ratio'),
-                line=dict(width=0.3, color='#7f8c8d'),
-            ),
-            text=[
-                f"<b>{idx_to_label[i]}</b><br>degree={int(total_deg[i])}<br>"
-                f"pos_ratio={pos_ratio[i]:.2f}"
-                for i in range(N)
+    # Exclude nodes without a matched bloc, or whose bloc has no position entry.
+    mask = np.array([
+        lbl != 'Unknown' and _normalize_text(lbl) in party_position_map
+        for lbl in party_labels
+    ])
+    if not np.any(mask):
+        print('Skipping interactive scatter: no matched bloc labels')
+    else:
+        emb_m = emb[mask]
+        total_deg_m = total_deg[mask]
+        # idx_to_label may be a list; collect matching labels
+        idxs = [i for i, m in enumerate(mask) if m]
+        labels_m = [idx_to_label[i] for i in idxs]
+        blocs_m = party_labels[mask]
+        bloc_positions = np.array([
+            party_position_map.get(_normalize_text(bloc), 0.0)
+            for bloc in blocs_m
+        ])
+
+        # Build per-node edge coordinate maps for interactive hover-rendering.
+        # Only include edges that connect visible nodes in the filtered scatter.
+        visible_nodes = set(idxs)
+        pos_edge_coords = {}
+        neg_edge_coords = {}
+        # idxs maps positions in emb_m -> original node index
+        for local_i, orig_idx in enumerate(idxs):
+            px, py = float(emb[orig_idx, 0]), float(emb[orig_idx, 1])
+            # positive outgoing
+            xs_p, ys_p = [], []
+            for v in adj_lists1_1.get(orig_idx, []):
+                if v not in visible_nodes:
+                    continue
+                xs_p.extend([px, float(emb[v, 0]), None])
+                ys_p.extend([py, float(emb[v, 1]), None])
+            # negative outgoing
+            xs_n, ys_n = [], []
+            for v in adj_lists2_1.get(orig_idx, []):
+                if v not in visible_nodes:
+                    continue
+                xs_n.extend([px, float(emb[v, 0]), None])
+                ys_n.extend([py, float(emb[v, 1]), None])
+            pos_edge_coords[str(orig_idx)] = {'x': xs_p, 'y': ys_p}
+            neg_edge_coords[str(orig_idx)] = {'x': xs_n, 'y': ys_n}
+
+        # Main node scatter plus two empty line traces for edges (pos / neg)
+        scatter_html = go.Figure(
+            data=[
+                go.Scatter(
+                    x=emb_m[:, 0],
+                    y=emb_m[:, 1],
+                    mode='markers',
+                    marker=dict(
+                        size=8,
+                        color=bloc_positions,
+                        colorscale='RdYlGn',
+                        colorbar=dict(title='Bloc Position'),
+                        cmin=-1.0,
+                        cmax=1.0,
+                        line=dict(width=0.3, color='#7f8c8d'),
+                    ),
+                    text=[
+                        f"<b>{labels_m[i]}</b><br>bloc={blocs_m[i]}<br>"
+                        f"degree={int(total_deg_m[i])}<br>"
+                        f"position={bloc_positions[i]:.2f}"
+                        for i in range(len(idxs))
+                    ],
+                    hoverinfo='text',
+                    customdata=idxs,
+                ),
+                go.Scatter(
+                    x=[], y=[], mode='lines', hoverinfo='none',
+                    line=dict(color='rgba(39,174,96,0.9)', width=2),
+                    name='positive edges', showlegend=False
+                ),
+                go.Scatter(
+                    x=[], y=[], mode='lines', hoverinfo='none',
+                    line=dict(color='rgba(192,57,43,0.9)', width=2, dash='dash'),
+                    name='negative edges', showlegend=False
+                ),
             ],
-            hoverinfo='text',
-        )],
-        layout=go.Layout(
-            title='Interactive 2-D Projection — Positive Edge Ratio',
-            xaxis=dict(title='Proj. Dim 1'),
-            yaxis=dict(title='Proj. Dim 2'),
-            hovermode='closest',
+            layout=go.Layout(
+                title='Interactive 2-D Projection — Bloc Position',
+                xaxis=dict(title='Proj. Dim 1'),
+                yaxis=dict(title='Proj. Dim 2'),
+                hovermode='closest',
+            )
         )
-    )
-    html_path = os.path.join(args.out_dir, 'proj_scatter_interactive.html')
-    pio.write_html(scatter_html, file=html_path,
-                   full_html=True, include_plotlyjs='cdn')
-    print(f"  ✓  {html_path}")
+
+        # Write HTML with embedded JS that listens for hover and updates edge traces
+        html_path = os.path.join(args.out_dir, 'proj_scatter_interactive.html')
+        import json
+        pos_json = json.dumps(pos_edge_coords)
+        neg_json = json.dumps(neg_edge_coords)
+
+        html_str = pio.to_html(scatter_html, full_html=True, include_plotlyjs='cdn', div_id='proj-scatter')
+        script = f"""
+<script>
+const POS_EDGES = {pos_json};
+const NEG_EDGES = {neg_json};
+const gd = document.getElementById('proj-scatter');
+if (gd) {{
+  gd.on('plotly_hover', function(data) {{
+    const pt = data.points[0];
+    const orig = String(pt.customdata);
+    const pos = POS_EDGES[orig] || {{x:[], y:[]}};
+    const neg = NEG_EDGES[orig] || {{x:[], y:[]}};
+    // traces: 0 = nodes, 1 = pos edges, 2 = neg edges
+    Plotly.restyle(gd, {{x: [pos.x], y: [pos.y]}}, [1]);
+    Plotly.restyle(gd, {{x: [neg.x], y: [neg.y]}}, [2]);
+  }});
+  gd.on('plotly_unhover', function() {{
+    Plotly.restyle(gd, {{x: [[]], y: [[]]}}, [1]);
+    Plotly.restyle(gd, {{x: [[]], y: [[]]}}, [2]);
+  }});
+}}
+</script>
+"""
+        with open(html_path, 'w', encoding='utf-8') as fh:
+            fh.write(html_str)
+            fh.write(script)
+        print(f"  ✓  {html_path}")
 
     if DASH_AVAILABLE:
         print(f"Generating interactive Dash app → {args.out_dir}/app_interactive.py")
@@ -1005,6 +1615,140 @@ if args.proj_dim >= 3:
     print(f"  ✓  {p}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Figure 8 — lda_ideology.png
+#
+# Three panels:
+#   (a) 1-D strip plot of LDA ideology scores, nodes coloured by party
+#   (b) Per-dimension loadings: which of the embed_dim raw dimensions drive
+#       the ideology axis (bar chart of lda_coef)
+#   (c) 2-D scatter of the two highest-loading raw dimensions, coloured by
+#       party — useful sanity check that the axis isn't degenerate
+# ─────────────────────────────────────────────────────────────────────────────
+if lda_ideology is not None and len(lda_indices) > 0:
+    _lda_norm   = Normalize(vmin=-1.0, vmax=1.0)
+    _lda_cmap   = plt.get_cmap('RdYlGn')
+
+    # Map each labelled node to a numeric party position for colouring
+    _bloc_pos = {
+        'ph': -1.0, 'pc': -0.85, 'frente amplio': -0.8,
+        'ps': -0.55, 'ppd': -0.4, 'prsd': -0.2,
+        'dc': 0.0,
+        'evopoli': 0.5, 'rn': 0.7, 'udi': 0.85, 'republicano': 1.0,
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
+    fig.suptitle(
+        'LDA Ideology Probe on Raw Embeddings\n'
+        f'embed_dim={args.embed_dim}  |  5-fold CV accuracy = {lda_score:.3f}'
+        f'  |  {n_left} left, {n_right} right nodes labelled',
+        fontsize=12, fontweight='bold')
+
+    # ── (a) 1-D ideology strip ──────────────────────────────────────────────
+    ax = axes[0]
+    rng_lda = np.random.RandomState(args.seed + 42)
+
+    # Pre-compute one jitter value per node so scatter points and annotation
+    # arrows both land at exactly the same y-coordinate.
+    node_jitter = rng_lda.normal(scale=0.08, size=N)
+
+    # Plot ALL nodes with known blocs (not just left/right training set)
+    known_bloc_parties = sorted(
+        set(_normalize_text(party_labels[i])
+            for i in range(N) if party_labels[i] != 'Unknown'),
+        key=lambda b: _bloc_pos.get(b, 0.0)
+    )
+    for bloc_norm in known_bloc_parties:
+        mask_b = np.array([_normalize_text(party_labels[i]) == bloc_norm for i in range(N)])
+        if not np.any(mask_b):
+            continue
+        pos = _bloc_pos.get(bloc_norm, 0.0)
+        raw_name = next((party_labels[i] for i in range(N) if _normalize_text(party_labels[i]) == bloc_norm), bloc_norm)
+        display  = _clean_display_name(raw_name)
+        ax.scatter(lda_ideology[mask_b], node_jitter[mask_b],
+                   c=np.full(mask_b.sum(), pos), cmap=_lda_cmap, norm=_lda_norm,
+                   s=40, alpha=0.85, linewidths=0.3, edgecolors='#7f8c8d',
+                   label=f"{_short(display, 16)} ({mask_b.sum()})")
+
+    # Annotate anchor politicians — reuse the same node_jitter[i] as the dot
+    _ann_names = LEFT_ANCHOR_NAMES + RIGHT_ANCHOR_NAMES
+    for i, lbl in idx_to_label.items():
+        if any(_normalize_text(lbl) == _normalize_text(n) for n in _ann_names):
+            is_left_ann = any(_normalize_text(lbl) == _normalize_text(n) for n in LEFT_ANCHOR_NAMES)
+            col = '#1f618d' if is_left_ann else '#922b21'
+            ax.annotate(
+                _short(lbl, 20),
+                xy=(lda_ideology[i], node_jitter[i]),          # exact dot position
+                xytext=(0, 10), textcoords='offset points',    # label 10 pt above
+                fontsize=7, ha='center', color=col,
+                arrowprops=dict(arrowstyle='-', color=col, lw=0.6),
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.85,
+                          ec=col, lw=0.6))
+
+    ax.axvline(0, color='#7f8c8d', ls='--', lw=1.2, alpha=0.7, label='Decision boundary')
+    ax.set_xlabel('LDA ideology score  (left ← 0 → right)')
+    ax.get_yaxis().set_visible(False)
+    ax.set_title('1-D LDA Ideology Axis\n(all nodes with known bloc, coloured by party)')
+    ax.grid(True, axis='x', alpha=0.25)
+    n_cols = 1 if len(known_bloc_parties) <= 8 else 2
+    ax.legend(fontsize=8, framealpha=0.9, loc='upper left',
+              bbox_to_anchor=(0.0, -0.08), borderaxespad=0., ncol=n_cols)
+
+    # ── (b) embedding dimension loadings ────────────────────────────────────
+    ax = axes[1]
+    dims = np.arange(len(lda_coef))
+    colors_bar = ['#c0392b' if c > 0 else '#2980b9' for c in lda_coef]
+    ax.bar(dims, lda_coef, color=colors_bar, alpha=0.85, edgecolor='white', lw=0.4)
+    # Mark top-5 most important dimensions
+    top5 = np.argsort(np.abs(lda_coef))[-5:]
+    for d in top5:
+        ax.bar(d, lda_coef[d],
+               color='#e67e22' if lda_coef[d] > 0 else '#8e44ad',
+               alpha=0.95, edgecolor='white', lw=0.4,
+               label=f'dim {d} ({lda_coef[d]:+.3f})' if d == top5[-1] else None)
+        ax.annotate(f'd{d}', (d, lda_coef[d] + np.sign(lda_coef[d]) * 0.005),
+                    ha='center', va='bottom' if lda_coef[d] >= 0 else 'top',
+                    fontsize=7, color='#2c3e50')
+    ax.axhline(0, color='#7f8c8d', lw=0.8)
+    ax.set_xlabel('Raw Embedding Dimension')
+    ax.set_ylabel('LDA Coefficient')
+    ax.set_title('Ideology Axis Loadings\n'
+                 'Which raw dims drive left vs right?\n'
+                 '(orange/purple = top-5 by |coef|)')
+    ax.set_xticks(dims[::2])
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # ── (c) 2-D scatter of the two top-loading dims ──────────────────────────
+    ax = axes[2]
+    top2 = np.argsort(np.abs(lda_coef))[-2:][::-1]
+    d0, d1 = int(top2[0]), int(top2[1])
+    for bloc_norm in known_bloc_parties:
+        mask_b = np.array([_normalize_text(party_labels[i]) == bloc_norm for i in range(N)])
+        if not np.any(mask_b):
+            continue
+        pos = _bloc_pos.get(bloc_norm, 0.0)
+        raw_name = next((party_labels[i] for i in range(N) if _normalize_text(party_labels[i]) == bloc_norm), bloc_norm)
+        display  = _clean_display_name(raw_name)
+        ax.scatter(raw_emb[mask_b, d0], raw_emb[mask_b, d1],
+                   c=np.full(mask_b.sum(), pos), cmap=_lda_cmap, norm=_lda_norm,
+                   s=40, alpha=0.85, linewidths=0.3, edgecolors='#7f8c8d',
+                   label=_short(display, 16))
+    ax.set_xlabel(f'Raw embedding dim {d0}  (coef={lda_coef[d0]:+.3f})')
+    ax.set_ylabel(f'Raw embedding dim {d1}  (coef={lda_coef[d1]:+.3f})')
+    ax.set_title(f'Top-2 ideology-loading raw dims\n(dim {d0} vs dim {d1})')
+    ax.grid(True, alpha=0.25)
+    sm_lda = plt.cm.ScalarMappable(norm=_lda_norm, cmap=_lda_cmap)
+    sm_lda.set_array([])
+    fig.colorbar(sm_lda, ax=ax, pad=0.02, label='Party position (left–right)')
+
+    plt.tight_layout()
+    p_lda = os.path.join(args.out_dir, 'lda_ideology.png')
+    plt.savefig(p_lda, dpi=150, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+    print(f"  ✓  {p_lda}")
+else:
+    print("Skipping LDA ideology figure: probe did not run successfully.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{'─'*60}")
@@ -1015,6 +1759,10 @@ print(f"proj_dim           : {args.proj_dim}")
 print(f"||WW^T - I||_F     : {ortho_err:.6f}")
 print(f"Final task loss    : {task_losses[-1]:.4f}")
 print(f"Final L_o          : {ortho_losses[-1]:.6f}")
+if lda_score is not None:
+    print(f"LDA ideology CV acc: {lda_score:.3f}  ({n_left} left, {n_right} right nodes)")
+    top5_dims = np.argsort(np.abs(lda_coef))[-5:][::-1]
+    print("Top-5 ideology dims:", ", ".join(f"dim{d}({lda_coef[d]:+.3f})" for d in top5_dims))
 
 print(f"\nTop-5 most positively perceived (min degree={args.min_degree}):")
 for i in sort_ord[-5:][::-1]:

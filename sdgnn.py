@@ -318,54 +318,72 @@ class SDGNN(nn.Module):
             neg_neigs_weight = torch.FloatTensor([weight_dict[node][i] for i in adj_lists2_1[node]]).to(DEVICES)
 
             if pos_num > 0:
-                # --- Sign loss: projected embeddings ---
+                # Weights for the sign loss: look up undirected pos neighbors
+                # (pos_neighbors uses adj_lists1, which is undirected).
+                # Fall back to 1.0 if a pair has no entry in weight_dict.
+                pos_sign_weight = torch.FloatTensor(
+                    [weight_dict[node].get(i, 1.0) for i in pos_neighbors[node]]
+                ).to(DEVICES)
+
+                # --- Sign loss: projected embeddings, log-normalised weights ---
                 pos_neig_embs_proj = nodes_embs_proj[pos_neigs, :]
                 loss_pku = F.binary_cross_entropy_with_logits(
                     torch.einsum("nj,j->n", [pos_neig_embs_proj, z1_proj]),
-                    torch.ones(pos_num).to(DEVICES))
+                    torch.ones(pos_num).to(DEVICES),
+                    weight=pos_sign_weight)
 
                 if len(sta_pos_neighs) > 0:
-                    # --- Direction loss: raw embeddings ---
+                    # --- Direction loss: raw embeddings, log-normalised weights ---
                     sta_pos_neig_embs = nodes_embs[sta_pos_neighs, :]
                     z11 = z1.repeat(len(sta_pos_neighs), 1)
                     rs = self.fc(torch.cat([z11, sta_pos_neig_embs], 1)).squeeze(-1)
-                    loss_pku += F.binary_cross_entropy_with_logits(rs, torch.ones(len(sta_pos_neighs)).to(DEVICES), \
-                                                                   weight=pos_neigs_weight
-                                                                   )
-                    # --- Triangle/status loss: raw embeddings ---
+                    loss_pku += F.binary_cross_entropy_with_logits(
+                        rs, torch.ones(len(sta_pos_neighs)).to(DEVICES),
+                        weight=pos_neigs_weight)
+
+                    # --- Triangle/status loss: raw embeddings, log-normalised weights ---
                     s1 = self.score_function1(z1).repeat(len(sta_pos_neighs), 1)
                     s2 = self.score_function2(sta_pos_neig_embs)
 
                     q = torch.where((s1 - s2) > -0.5, torch.Tensor([-0.5]).repeat(s1.shape).to(DEVICES), s1 - s2)
                     tmp = (q - (s1 - s2))
-                    loss_pku += 5 * torch.einsum("ij,ij->", [tmp, tmp])
+                    # weight each node pair's contribution by its edge weight
+                    w2d = pos_neigs_weight.unsqueeze(1).expand_as(tmp)
+                    loss_pku += 5 * torch.einsum("ij,ij->", [tmp * w2d, tmp])
 
                 loss_total += loss_pku
 
             if neg_num > 0:
-                # --- Sign loss: projected embeddings ---
+                # Weights for the sign loss: undirected neg neighbors
+                neg_sign_weight = torch.FloatTensor(
+                    [weight_dict[node].get(i, 1.0) for i in neg_neighbors[node]]
+                ).to(DEVICES)
+
+                # --- Sign loss: projected embeddings, log-normalised weights ---
                 neg_neig_embs_proj = nodes_embs_proj[neg_neigs, :]
                 loss_pku = F.binary_cross_entropy_with_logits(
                     torch.einsum("nj,j->n", [neg_neig_embs_proj, z1_proj]),
-                    torch.zeros(neg_num).to(DEVICES))
+                    torch.zeros(neg_num).to(DEVICES),
+                    weight=neg_sign_weight)
 
                 if len(sta_neg_neighs) > 0:
-                    # --- Direction loss: raw embeddings ---
+                    # --- Direction loss: raw embeddings, log-normalised weights ---
                     sta_neg_neig_embs = nodes_embs[sta_neg_neighs, :]
                     z12 = z1.repeat(len(sta_neg_neighs), 1)
                     rs = self.fc(torch.cat([z12, sta_neg_neig_embs], 1)).squeeze(-1)
+                    loss_pku += F.binary_cross_entropy_with_logits(
+                        rs, torch.zeros(len(sta_neg_neighs)).to(DEVICES),
+                        weight=neg_neigs_weight)
 
-                    loss_pku += F.binary_cross_entropy_with_logits(rs, torch.zeros(len(sta_neg_neighs)).to(DEVICES), \
-                                                                   weight=neg_neigs_weight)
-
-                    # --- Triangle/status loss: raw embeddings ---
+                    # --- Triangle/status loss: raw embeddings, log-normalised weights ---
                     s1 = self.score_function1(z1).repeat(len(sta_neg_neighs), 1)
                     s2 = self.score_function2(sta_neg_neig_embs)
 
                     q = torch.where(s1 - s2 > 0.5, s1 - s2, torch.Tensor([0.5]).repeat(s1.shape).to(DEVICES))
-
                     tmp = (q - (s1 - s2))
-                    loss_pku += 5 * torch.einsum("ij,ij->", [tmp, tmp])
+                    # weight each node pair's contribution by its edge weight
+                    w2d = neg_neigs_weight.unsqueeze(1).expand_as(tmp)
+                    loss_pku += 5 * torch.einsum("ij,ij->", [tmp * w2d, tmp])
 
                 loss_total += loss_pku
 
